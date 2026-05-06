@@ -4,12 +4,13 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -46,6 +47,154 @@ from .settings_store import load_settings, save_settings
 from .widgets import ImageCanvas, PointCloud3DCanvas, PointCloudBevCanvas
 
 
+class FullScreenProjectionWindow(QDialog):
+    extrinsicsChanged = Signal(object)
+
+    def __init__(
+        self,
+        source_canvas: ImageCanvas,
+        extrinsics: Extrinsics,
+        step_index: int,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("点云投影全屏微调")
+        self._syncing = False
+
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.canvas = ImageCanvas("")
+        self.canvas.copy_from(source_canvas)
+        self.canvas.set_fullscreen_enabled(True)
+        self.canvas.set_fullscreen_button_tooltip("退出全屏")
+        self.canvas.fullScreenRequested.connect(self.close)
+        root_layout.addWidget(self.canvas, 1)
+
+        self.panel = QWidget()
+        self.panel.setFixedWidth(330)
+        self.panel.setStyleSheet(
+            "QWidget { background: #202020; color: #f0f0f0; }"
+            "QGroupBox { border: 1px solid #444; margin-top: 10px; padding-top: 10px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
+            "QDoubleSpinBox, QComboBox { background: #2b2b2b; border: 1px solid #555; padding: 4px; }"
+            "QPushButton { background: #303030; border: 1px solid #666; padding: 7px; }"
+            "QPushButton:hover { background: #3b3b3b; }"
+        )
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(14, 14, 14, 14)
+        panel_layout.setSpacing(10)
+
+        title = QLabel("外参实时微调")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        panel_layout.addWidget(title)
+
+        self.step_mode_combo = QComboBox()
+        self.step_mode_combo.addItem("精细 (T:0.001, R:0.01 deg)", (0.001, 0.01))
+        self.step_mode_combo.addItem("普通 (T:0.01, R:0.1 deg)", (0.01, 0.1))
+        self.step_mode_combo.addItem("粗略 (T:0.1, R:1 deg)", (0.1, 1.0))
+        self.step_mode_combo.setCurrentIndex(max(0, min(step_index, self.step_mode_combo.count() - 1)))
+
+        self.transform_group = QGroupBox("LiDAR -> Camera")
+        transform_layout = QFormLayout(self.transform_group)
+        self.tx_spin = self._make_double_spin(-100.0, 100.0, 0.0, 0.01, 5)
+        self.ty_spin = self._make_double_spin(-100.0, 100.0, 0.0, 0.01, 5)
+        self.tz_spin = self._make_double_spin(-100.0, 100.0, 0.0, 0.01, 5)
+        self.roll_spin = self._make_double_spin(-180.0, 180.0, 0.0, 0.1, 5)
+        self.pitch_spin = self._make_double_spin(-180.0, 180.0, 0.0, 0.1, 5)
+        self.yaw_spin = self._make_double_spin(-180.0, 180.0, 0.0, 0.1, 5)
+        transform_layout.addRow("调节步长", self.step_mode_combo)
+        transform_layout.addRow("x / tx (m)", self.tx_spin)
+        transform_layout.addRow("y / ty (m)", self.ty_spin)
+        transform_layout.addRow("z / tz (m)", self.tz_spin)
+        transform_layout.addRow("roll (deg)", self.roll_spin)
+        transform_layout.addRow("pitch (deg)", self.pitch_spin)
+        transform_layout.addRow("yaw (deg)", self.yaw_spin)
+        panel_layout.addWidget(self.transform_group)
+
+        self.projection_label = QLabel("投影状态: --")
+        self.projection_label.setWordWrap(True)
+        panel_layout.addWidget(self.projection_label)
+        panel_layout.addStretch(1)
+
+        self.reset_view_button = QPushButton("重置视图")
+        self.close_button = QPushButton("退出全屏")
+        panel_layout.addWidget(self.reset_view_button)
+        panel_layout.addWidget(self.close_button)
+        root_layout.addWidget(self.panel)
+
+        self._set_extrinsics_controls(extrinsics)
+        self._on_step_mode_changed(self.step_mode_combo.currentIndex())
+        self._connect_signals()
+
+        self._escape_shortcut = QShortcut(QKeySequence("Esc"), self)
+        self._escape_shortcut.activated.connect(self.close)
+
+    def _connect_signals(self) -> None:
+        for widget in self._extrinsic_spins():
+            widget.valueChanged.connect(self._on_extrinsics_changed)
+        self.step_mode_combo.currentIndexChanged.connect(self._on_step_mode_changed)
+        self.reset_view_button.clicked.connect(self.canvas.reset_view)
+        self.close_button.clicked.connect(self.close)
+
+    def _make_double_spin(self, minimum: float, maximum: float, value: float, step: float, decimals: int) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        spin.setSingleStep(step)
+        spin.setDecimals(decimals)
+        return spin
+
+    def _extrinsic_spins(self) -> list[QDoubleSpinBox]:
+        return [self.tx_spin, self.ty_spin, self.tz_spin, self.roll_spin, self.pitch_spin, self.yaw_spin]
+
+    def _on_step_mode_changed(self, _index: int) -> None:
+        t_step, r_step = self.step_mode_combo.currentData()
+        for spin in [self.tx_spin, self.ty_spin, self.tz_spin]:
+            spin.setSingleStep(t_step)
+        for spin in [self.roll_spin, self.pitch_spin, self.yaw_spin]:
+            spin.setSingleStep(r_step)
+
+    def _current_extrinsics(self) -> Extrinsics:
+        return Extrinsics(
+            tx=self.tx_spin.value(),
+            ty=self.ty_spin.value(),
+            tz=self.tz_spin.value(),
+            roll_deg=self.roll_spin.value(),
+            pitch_deg=self.pitch_spin.value(),
+            yaw_deg=self.yaw_spin.value(),
+        )
+
+    def _set_extrinsics_controls(self, extrinsics: Extrinsics) -> None:
+        self._syncing = True
+        for spin in self._extrinsic_spins():
+            spin.blockSignals(True)
+        try:
+            self.tx_spin.setValue(extrinsics.tx)
+            self.ty_spin.setValue(extrinsics.ty)
+            self.tz_spin.setValue(extrinsics.tz)
+            self.roll_spin.setValue(extrinsics.roll_deg)
+            self.pitch_spin.setValue(extrinsics.pitch_deg)
+            self.yaw_spin.setValue(extrinsics.yaw_deg)
+        finally:
+            for spin in self._extrinsic_spins():
+                spin.blockSignals(False)
+            self._syncing = False
+
+    def _on_extrinsics_changed(self, _value: float) -> None:
+        if self._syncing:
+            return
+        self.extrinsicsChanged.emit(self._current_extrinsics())
+
+    def sync_from_source(self, source_canvas: ImageCanvas, extrinsics: Extrinsics) -> None:
+        self.canvas.copy_from(source_canvas, preserve_view=True)
+        self.canvas.set_fullscreen_enabled(True)
+        self.canvas.set_fullscreen_button_tooltip("退出全屏")
+        self._set_extrinsics_controls(extrinsics)
+        self.projection_label.setText(" / ".join(source_canvas._status_lines) if source_canvas._status_lines else "投影状态: --")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -66,6 +215,7 @@ class MainWindow(QMainWindow):
         self.pcd_cache: dict[str, PointCloudData] = {}
         self.current_filtered_points = np.zeros((0, 3), dtype=np.float32)
         self.current_filtered_intensity = np.zeros((0,), dtype=np.float32)
+        self.projection_fullscreen_window: FullScreenProjectionWindow | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -103,6 +253,7 @@ class MainWindow(QMainWindow):
 
         self.raw_image_canvas = ImageCanvas("原始相机图像")
         self.overlay_canvas = ImageCanvas("点云投影叠加")
+        self.overlay_canvas.set_fullscreen_enabled(True)
         self.raw_bev_canvas = PointCloud3DCanvas("原始雷达 3D")
         self.frustum_bev_canvas = PointCloudBevCanvas("BEV 对齐视图（含相机视场）")
 
@@ -351,6 +502,7 @@ class MainWindow(QMainWindow):
 
         self.reset_view3d_button.clicked.connect(self.raw_bev_canvas.reset_view)
         self.raw_bev_canvas.viewChanged.connect(self._save_3d_view_state)
+        self.overlay_canvas.fullScreenRequested.connect(self._open_projection_fullscreen)
 
         self.pick_image_button.toggled.connect(self.raw_image_canvas.set_pick_enabled)
         self.pick_lidar_button.toggled.connect(self.raw_bev_canvas.set_pick_enabled)
@@ -361,6 +513,29 @@ class MainWindow(QMainWindow):
         self.remove_corr_button.clicked.connect(self._remove_selected_correspondence)
         self.clear_corr_button.clicked.connect(self._clear_correspondences)
         self.solve_corr_button.clicked.connect(self._solve_from_correspondences)
+
+    def _open_projection_fullscreen(self) -> None:
+        if self.projection_fullscreen_window is not None:
+            self.projection_fullscreen_window.close()
+
+        window = FullScreenProjectionWindow(
+            self.overlay_canvas,
+            self._current_extrinsics(),
+            self.step_mode_combo.currentIndex(),
+            self,
+        )
+        self.projection_fullscreen_window = window
+        window.extrinsicsChanged.connect(self._apply_fullscreen_extrinsics)
+        window.finished.connect(lambda _result, closed_window=window: self._clear_projection_fullscreen(closed_window))
+        window.showFullScreen()
+
+    def _clear_projection_fullscreen(self, window: FullScreenProjectionWindow) -> None:
+        if self.projection_fullscreen_window is window:
+            self.projection_fullscreen_window = None
+
+    def _apply_fullscreen_extrinsics(self, extrinsics: Extrinsics) -> None:
+        self._set_extrinsics_controls(extrinsics)
+        self._update_visuals()
 
     def _wrap_widget(self, title: str, widget: QWidget) -> QWidget:
         group = QGroupBox(title)
@@ -557,12 +732,19 @@ class MainWindow(QMainWindow):
         self.flip_mode_combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _set_extrinsics_controls(self, extrinsics: Extrinsics) -> None:
-        self.tx_spin.setValue(extrinsics.tx)
-        self.ty_spin.setValue(extrinsics.ty)
-        self.tz_spin.setValue(extrinsics.tz)
-        self.roll_spin.setValue(extrinsics.roll_deg)
-        self.pitch_spin.setValue(extrinsics.pitch_deg)
-        self.yaw_spin.setValue(extrinsics.yaw_deg)
+        spins = [self.tx_spin, self.ty_spin, self.tz_spin, self.roll_spin, self.pitch_spin, self.yaw_spin]
+        for spin in spins:
+            spin.blockSignals(True)
+        try:
+            self.tx_spin.setValue(extrinsics.tx)
+            self.ty_spin.setValue(extrinsics.ty)
+            self.tz_spin.setValue(extrinsics.tz)
+            self.roll_spin.setValue(extrinsics.roll_deg)
+            self.pitch_spin.setValue(extrinsics.pitch_deg)
+            self.yaw_spin.setValue(extrinsics.yaw_deg)
+        finally:
+            for spin in spins:
+                spin.blockSignals(False)
 
     def _current_intrinsics(self) -> CameraIntrinsics:
         distortion_values = []
@@ -707,6 +889,9 @@ class MainWindow(QMainWindow):
             self.frame_delta_label.setText("时间差: 索引配对")
         else:
             self.frame_delta_label.setText(f"时间差: {pair.delta_seconds * 1000.0:.3f} ms")
+
+        if self.projection_fullscreen_window is not None:
+            self.projection_fullscreen_window.sync_from_source(self.overlay_canvas, self.current_extrinsics)
 
     def _build_marker_lists(self) -> tuple[list[tuple[float, float, str, QColor]], list[tuple[float, float, float, str, QColor]]]:
         image_markers: list[tuple[float, float, str, QColor]] = []

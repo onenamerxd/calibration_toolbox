@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QWidget
 
 class ImageCanvas(QWidget):
     pointPicked = Signal(float, float)
+    fullScreenRequested = Signal()
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -26,16 +27,30 @@ class ImageCanvas(QWidget):
         self._flip_mode = 0
         self._source_image_cache_key: int | None = None
         self._rendered_flip_mode = self._flip_mode
+        self._fullscreen_enabled = False
+        self._fullscreen_hovered = False
+        self._fullscreen_button_tooltip = "全屏显示"
         self.setMinimumSize(400, 280)
         self.setMouseTracking(True)
 
     def set_pick_enabled(self, enabled: bool) -> None:
         self._pick_enabled = enabled
-        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self._sync_cursor()
 
     def set_status_lines(self, lines: list[str]) -> None:
         self._status_lines = lines
         self.update()
+
+    def set_fullscreen_enabled(self, enabled: bool) -> None:
+        self._fullscreen_enabled = enabled
+        if not enabled:
+            self._fullscreen_hovered = False
+            self.setToolTip("")
+        self._sync_cursor()
+        self.update()
+
+    def set_fullscreen_button_tooltip(self, text: str) -> None:
+        self._fullscreen_button_tooltip = text
 
     def set_flip_mode(self, flip_mode: int) -> None:
         self._flip_mode = flip_mode
@@ -74,6 +89,29 @@ class ImageCanvas(QWidget):
         self._markers = markers
         self.update()
 
+    def copy_from(self, other: "ImageCanvas", preserve_view: bool = False) -> None:
+        zoom = self._zoom
+        pan = QPointF(self._pan)
+        self._title = other._title
+        self._image = QImage(other._image)
+        self._overlay_points = other._overlay_points.copy()
+        self._overlay_colors = other._overlay_colors.copy()
+        self._markers = list(other._markers)
+        self._status_lines = list(other._status_lines)
+        self._flip_mode = other._flip_mode
+        self._source_image_cache_key = other._source_image_cache_key
+        self._rendered_flip_mode = other._rendered_flip_mode
+        self._pick_enabled = other._pick_enabled
+        self._fullscreen_enabled = other._fullscreen_enabled
+        if preserve_view:
+            self._zoom = zoom
+            self._pan = pan
+        else:
+            self._zoom = other._zoom
+            self._pan = QPointF(other._pan)
+        self._sync_cursor()
+        self.update()
+
     def reset_view(self) -> None:
         self._zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
@@ -107,6 +145,57 @@ class ImageCanvas(QWidget):
         y = rect.top() + (v / self._image.height()) * rect.height()
         return QPointF(x, y)
 
+    def _fullscreen_button_rect(self) -> QRectF:
+        size = 34.0
+        margin = 12.0
+        return QRectF(self.width() - size - margin, self.height() - size - margin, size, size)
+
+    def _draw_fullscreen_button(self, painter: QPainter) -> None:
+        if not self._fullscreen_enabled:
+            return
+
+        rect = self._fullscreen_button_rect()
+        bg = QColor(45, 45, 45, 230) if self._fullscreen_hovered else QColor(32, 32, 32, 210)
+        border = QColor(160, 160, 160) if self._fullscreen_hovered else QColor(95, 95, 95)
+
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, 4.0, 4.0)
+
+        painter.setPen(QPen(QColor(245, 245, 245), 2))
+        pad = 9.0
+        short = 7.0
+        left = rect.left() + pad
+        right = rect.right() - pad
+        top = rect.top() + pad
+        bottom = rect.bottom() - pad
+
+        painter.drawLine(QPointF(left, top), QPointF(left + short, top))
+        painter.drawLine(QPointF(left, top), QPointF(left, top + short))
+        painter.drawLine(QPointF(right, top), QPointF(right - short, top))
+        painter.drawLine(QPointF(right, top), QPointF(right, top + short))
+        painter.drawLine(QPointF(left, bottom), QPointF(left + short, bottom))
+        painter.drawLine(QPointF(left, bottom), QPointF(left, bottom - short))
+        painter.drawLine(QPointF(right, bottom), QPointF(right - short, bottom))
+        painter.drawLine(QPointF(right, bottom), QPointF(right, bottom - short))
+
+    def _sync_cursor(self) -> None:
+        if self._fullscreen_enabled and self._fullscreen_hovered:
+            self.setCursor(Qt.PointingHandCursor)
+        elif self._pick_enabled:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def _update_fullscreen_hover(self, pos: QPointF) -> None:
+        hovered = self._fullscreen_enabled and self._fullscreen_button_rect().contains(pos)
+        if hovered == self._fullscreen_hovered:
+            return
+        self._fullscreen_hovered = hovered
+        self.setToolTip(self._fullscreen_button_tooltip if hovered else "")
+        self._sync_cursor()
+        self.update()
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(18, 18, 18))
@@ -118,6 +207,7 @@ class ImageCanvas(QWidget):
         if self._image.isNull():
             painter.setPen(QColor(120, 120, 120))
             painter.drawText(self.rect(), Qt.AlignCenter, "未加载图像")
+            self._draw_fullscreen_button(painter)
             return
 
         rect = self._image_rect()
@@ -153,6 +243,8 @@ class ImageCanvas(QWidget):
                 painter.drawText(12, y, line)
                 y += 14
 
+        self._draw_fullscreen_button(painter)
+
     def wheelEvent(self, event) -> None:
         if self._image.isNull():
             return
@@ -179,6 +271,10 @@ class ImageCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self._fullscreen_enabled and self._fullscreen_button_rect().contains(event.position()):
+            self.fullScreenRequested.emit()
+            return
+
         if event.button() == Qt.RightButton:
             self._last_drag_pos = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
@@ -191,6 +287,7 @@ class ImageCanvas(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._last_drag_pos is None:
+            self._update_fullscreen_hover(event.position())
             return
         delta = event.pos() - self._last_drag_pos
         self._pan += QPointF(delta.x(), delta.y())
@@ -200,10 +297,18 @@ class ImageCanvas(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.RightButton:
             self._last_drag_pos = None
-            self.setCursor(Qt.CrossCursor if self._pick_enabled else Qt.ArrowCursor)
+            self._update_fullscreen_hover(event.position())
+            self._sync_cursor()
 
     def mouseDoubleClickEvent(self, _event: QMouseEvent) -> None:
         self.reset_view()
+
+    def leaveEvent(self, _event) -> None:
+        if self._fullscreen_hovered:
+            self._fullscreen_hovered = False
+            self.setToolTip("")
+            self._sync_cursor()
+            self.update()
 
 
 class PointCloudBevCanvas(QWidget):
