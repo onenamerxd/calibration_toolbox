@@ -36,15 +36,25 @@ from PySide6.QtWidgets import (
 
 from .io_utils import build_frame_pairs, load_camera_json, load_pcd, load_qimage
 from .math_utils import (
+    export_extrinsics,
     camera_frustum_in_lidar,
     depth_to_rgb,
-    euler_deg_to_quaternion,
     project_lidar_to_image,
     solve_extrinsics_from_correspondences,
 )
 from .models import CalibrationCorrespondence, CameraIntrinsics, Extrinsics, FramePair, PointCloudData
 from .settings_store import load_settings, save_settings
 from .widgets import ImageCanvas, PointCloud3DCanvas, PointCloudBevCanvas
+
+
+EXPORT_DIRECTION_OPTIONS = [
+    ("LiDAR -> Camera", "lidar_to_camera"),
+    ("Camera -> LiDAR", "camera_to_lidar"),
+]
+
+LIDAR_AXIS_OPTIONS = [
+    ("Apollo LS LiDAR / RFU (x右 y前 z上)", "apollo_lslidar_rfu"),
+]
 
 
 class FullScreenProjectionWindow(QDialog):
@@ -440,6 +450,25 @@ class MainWindow(QMainWindow):
         extr_layout.addRow("pitch (deg)", self.pitch_spin)
         extr_layout.addRow("yaw (deg)", self.yaw_spin)
 
+        self.export_direction_combo = QComboBox()
+        for label, value in EXPORT_DIRECTION_OPTIONS:
+            self.export_direction_combo.addItem(label, value)
+        extr_layout.addRow("导出方向", self.export_direction_combo)
+
+        self.adjust_lidar_axis_checkbox = QCheckBox("导出时调整雷达实际朝向")
+        self.adjust_lidar_axis_checkbox.setChecked(False)
+        extr_layout.addRow("", self.adjust_lidar_axis_checkbox)
+
+        self.lidar_axis_combo = QComboBox()
+        for label, value in LIDAR_AXIS_OPTIONS:
+            self.lidar_axis_combo.addItem(label, value)
+        self.lidar_axis_combo.setEnabled(False)
+        extr_layout.addRow("雷达朝向预设", self.lidar_axis_combo)
+
+        self.export_hint_label = QLabel("导出设置只影响输出 JSON，不影响当前投影和求解。")
+        self.export_hint_label.setWordWrap(True)
+        extr_layout.addRow("", self.export_hint_label)
+
         extr_button_row = QHBoxLayout()
         self.reset_extr_button = QPushButton("重置外参")
         self.json_extr_button = QPushButton("用 JSON 外参初始化")
@@ -499,6 +528,10 @@ class MainWindow(QMainWindow):
         self.reset_extr_button.clicked.connect(self._reset_extrinsics)
         self.json_extr_button.clicked.connect(self._apply_loaded_json_extrinsics)
         self.export_extr_button.clicked.connect(self._export_extrinsics)
+        self.export_direction_combo.currentIndexChanged.connect(self._on_export_settings_changed)
+        self.adjust_lidar_axis_checkbox.toggled.connect(self._on_export_settings_changed)
+        self.adjust_lidar_axis_checkbox.toggled.connect(self.lidar_axis_combo.setEnabled)
+        self.lidar_axis_combo.currentIndexChanged.connect(self._on_export_settings_changed)
 
         self.reset_view3d_button.clicked.connect(self.raw_bev_canvas.reset_view)
         self.raw_bev_canvas.viewChanged.connect(self._save_3d_view_state)
@@ -567,6 +600,17 @@ class MainWindow(QMainWindow):
         spin.setSingleStep(step)
         spin.setDecimals(decimals)
         return spin
+
+    def _on_export_settings_changed(self, *_args) -> None:
+        self._refresh_extrinsics_output()
+
+    def _current_export_direction(self) -> str:
+        return str(self.export_direction_combo.currentData())
+
+    def _current_lidar_axis_mode(self) -> str:
+        if not self.adjust_lidar_axis_checkbox.isChecked():
+            return "default"
+        return str(self.lidar_axis_combo.currentData())
 
     def _choose_image_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择图片文件夹", self.image_dir_edit.text() or str(Path.home()))
@@ -909,17 +953,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_extrinsics_output(self) -> None:
         extrinsics = self._current_extrinsics()
-        quaternion = euler_deg_to_quaternion(extrinsics.roll_deg, extrinsics.pitch_deg, extrinsics.yaw_deg)
-        payload = {
-            "translation": [extrinsics.tx, extrinsics.ty, extrinsics.tz],
-            "rotation_xyzw": [quaternion[0], quaternion[1], quaternion[2], quaternion[3]],
-            "euler_deg": {
-                "roll": extrinsics.roll_deg,
-                "pitch": extrinsics.pitch_deg,
-                "yaw": extrinsics.yaw_deg,
-            },
-            "convention": "P_cam = R * P_lidar + t",
-        }
+        payload = export_extrinsics(
+            extrinsics,
+            lidar_axis_mode=self._current_lidar_axis_mode(),
+            direction=self._current_export_direction(),
+        )
         self.extr_output.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _refresh_correspondence_views(self) -> None:
@@ -1024,12 +1062,21 @@ class MainWindow(QMainWindow):
         self._update_visuals()
 
     def _export_extrinsics(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "导出外参 JSON", str(Path.home() / "lidar_to_camera_extrinsics.json"), "JSON (*.json)")
+        default_name = (
+            "lidar_to_camera_extrinsics.json"
+            if self._current_export_direction() == "lidar_to_camera"
+            else "camera_to_lidar_extrinsics.json"
+        )
+        path, _ = QFileDialog.getSaveFileName(self, "导出外参 JSON", str(Path.home() / default_name), "JSON (*.json)")
         if not path:
             return
         payload = json.loads(self.extr_output.toPlainText())
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._append_log(f"已导出外参到 {path}")
+        axis_desc = "默认朝向" if self._current_lidar_axis_mode() == "default" else self.lidar_axis_combo.currentText()
+        self._append_log(
+            f"已导出外参到 {path} "
+            f"(方向: {self.export_direction_combo.currentText()}, 雷达朝向: {axis_desc})"
+        )
 
     def _append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)

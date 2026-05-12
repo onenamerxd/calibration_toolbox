@@ -17,6 +17,46 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
 PCD_EXTENSIONS = {".pcd"}
 
 
+def _xyz_from_sequence_or_mapping(value) -> list[float] | None:
+    if isinstance(value, dict):
+        if all(key in value for key in ("x", "y", "z")):
+            return [float(value["x"]), float(value["y"]), float(value["z"])]
+        return None
+
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return [float(value[0]), float(value[1]), float(value[2])]
+    return None
+
+
+def _xyzw_from_sequence_or_mapping(value) -> list[float] | None:
+    if isinstance(value, dict):
+        if all(key in value for key in ("x", "y", "z", "w")):
+            return [float(value["x"]), float(value["y"]), float(value["z"]), float(value["w"])]
+        if all(key in value for key in ("qx", "qy", "qz", "qw")):
+            return [float(value["qx"]), float(value["qy"]), float(value["qz"]), float(value["qw"])]
+        return None
+
+    if isinstance(value, (list, tuple)) and len(value) >= 4:
+        return [float(value[0]), float(value[1]), float(value[2]), float(value[3])]
+    return None
+
+
+def _extract_extrinsics_payload(payload: dict) -> tuple[list[float], list[float]] | None:
+    translation_value = payload.get("translation")
+    rotation_value = payload.get("rotation_xyzw", payload.get("rotation"))
+
+    transform = payload.get("transform")
+    if isinstance(transform, dict):
+        translation_value = transform.get("translation", translation_value)
+        rotation_value = transform.get("rotation", rotation_value)
+
+    translation = _xyz_from_sequence_or_mapping(translation_value)
+    rotation_xyzw = _xyzw_from_sequence_or_mapping(rotation_value)
+    if translation is None or rotation_xyzw is None:
+        return None
+    return translation, rotation_xyzw
+
+
 def parse_timestamp(path: Path) -> float | None:
     stem = path.stem
     try:
@@ -61,10 +101,11 @@ def load_camera_json(json_path: str | Path) -> tuple[CameraIntrinsics | None, Ex
             flip_mode=int(payload.get("flip_mode", 0)),
         )
 
-    if "rotation" in payload and "translation" in payload:
-        rotation = quaternion_to_matrix(payload["rotation"])
+    extrinsics_payload = _extract_extrinsics_payload(payload)
+    if extrinsics_payload is not None:
+        translation, rotation_xyzw = extrinsics_payload
+        rotation = quaternion_to_matrix(rotation_xyzw)
         roll, pitch, yaw = matrix_to_euler_deg(rotation)
-        translation = payload["translation"]
         extrinsics = Extrinsics(
             tx=float(translation[0]),
             ty=float(translation[1]),

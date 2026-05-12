@@ -9,6 +9,22 @@ from scipy.optimize import least_squares
 from .models import CalibrationCorrespondence, CameraIntrinsics, Extrinsics
 
 
+LIDAR_AXIS_MAPS: dict[str, np.ndarray] = {
+    "default": np.eye(3, dtype=np.float64),
+    # Calibration tool lidar frame: FLU (x forward, y left, z up)
+    # Apollo LS LiDAR / NovAtel vehicle-style target: RFU (x right, y forward, z up)
+    # p_lidar_tool = C * p_lidar_apollo
+    "apollo_lslidar_rfu": np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    ),
+}
+
+
 def euler_deg_to_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
     roll = math.radians(roll_deg)
     pitch = math.radians(pitch_deg)
@@ -58,6 +74,41 @@ def quaternion_to_matrix(quaternion_xyzw: Iterable[float]) -> np.ndarray:
     )
 
 
+def matrix_to_quaternion(matrix: np.ndarray) -> tuple[float, float, float, float]:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    trace = float(matrix[0, 0] + matrix[1, 1] + matrix[2, 2])
+
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (matrix[2, 1] - matrix[1, 2]) / s
+        y = (matrix[0, 2] - matrix[2, 0]) / s
+        z = (matrix[1, 0] - matrix[0, 1]) / s
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = math.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        w = (matrix[2, 1] - matrix[1, 2]) / s
+        x = 0.25 * s
+        y = (matrix[0, 1] + matrix[1, 0]) / s
+        z = (matrix[0, 2] + matrix[2, 0]) / s
+    elif matrix[1, 1] > matrix[2, 2]:
+        s = math.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        w = (matrix[0, 2] - matrix[2, 0]) / s
+        x = (matrix[0, 1] + matrix[1, 0]) / s
+        y = 0.25 * s
+        z = (matrix[1, 2] + matrix[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        w = (matrix[1, 0] - matrix[0, 1]) / s
+        x = (matrix[0, 2] + matrix[2, 0]) / s
+        y = (matrix[1, 2] + matrix[2, 1]) / s
+        z = 0.25 * s
+
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm < 1e-12:
+        return 0.0, 0.0, 0.0, 1.0
+    return x / norm, y / norm, z / norm, w / norm
+
+
 def euler_deg_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> tuple[float, float, float, float]:
     roll = math.radians(roll_deg) * 0.5
     pitch = math.radians(pitch_deg) * 0.5
@@ -78,6 +129,47 @@ def extrinsics_to_rt(extrinsics: Extrinsics) -> tuple[np.ndarray, np.ndarray]:
     rotation = euler_deg_to_matrix(extrinsics.roll_deg, extrinsics.pitch_deg, extrinsics.yaw_deg)
     translation = np.array([extrinsics.tx, extrinsics.ty, extrinsics.tz], dtype=np.float64)
     return rotation, translation
+
+
+def export_extrinsics(
+    extrinsics: Extrinsics,
+    lidar_axis_mode: str = "default",
+    direction: str = "lidar_to_camera",
+) -> dict:
+    if lidar_axis_mode not in LIDAR_AXIS_MAPS:
+        raise ValueError(f"unknown lidar axis mode: {lidar_axis_mode}")
+    if direction not in {"lidar_to_camera", "camera_to_lidar"}:
+        raise ValueError(f"unknown export direction: {direction}")
+
+    rotation_tool, translation = extrinsics_to_rt(extrinsics)
+    axis_transform = LIDAR_AXIS_MAPS[lidar_axis_mode]
+    rotation_lidar_to_camera = rotation_tool @ axis_transform
+
+    if direction == "lidar_to_camera":
+        rotation_out = rotation_lidar_to_camera
+        translation_out = translation
+        convention = "P_cam = R * P_lidar + t"
+    else:
+        rotation_out = rotation_lidar_to_camera.T
+        translation_out = -rotation_out @ translation
+        convention = "P_lidar = R * P_cam + t"
+
+    roll_deg, pitch_deg, yaw_deg = matrix_to_euler_deg(rotation_out)
+    quaternion = matrix_to_quaternion(rotation_out)
+    return {
+        "translation": [float(v) for v in translation_out],
+        "rotation_xyzw": [float(v) for v in quaternion],
+        "euler_deg": {
+            "roll": float(roll_deg),
+            "pitch": float(pitch_deg),
+            "yaw": float(yaw_deg),
+        },
+        "convention": convention,
+        "metadata": {
+            "export_direction": direction,
+            "lidar_axis_mode": lidar_axis_mode,
+        },
+    }
 
 
 def transform_lidar_to_camera(points_xyz: np.ndarray, extrinsics: Extrinsics) -> np.ndarray:
