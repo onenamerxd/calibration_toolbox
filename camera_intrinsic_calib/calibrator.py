@@ -108,9 +108,22 @@ def detect_circle_grid_corners(
     )
 
 
-def build_object_points(pattern_size: tuple[int, int], square_size: float) -> np.ndarray:
-    objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2) * square_size
+def build_object_points(
+    pattern_size: tuple[int, int],
+    square_size: float,
+    pattern_type: Literal["chessboard", "symmetric_circles", "asymmetric_circles"] = "chessboard",
+) -> np.ndarray:
+    rows, cols = pattern_size
+    objp = np.zeros((rows * cols, 3), np.float32)
+    grid = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    if pattern_type == "asymmetric_circles":
+        objp[:, 0] = (2.0 * grid[:, 0] + grid[:, 1] % 2) * square_size
+        objp[:, 1] = grid[:, 1] * square_size
+        return objp
+
+    # OpenCV returns chessboard/symmetric-grid points row by row, with columns changing fastest.
+    # Keep the object-point ordering aligned with that image-point ordering.
+    objp[:, :2] = grid * square_size
     return objp
 
 
@@ -120,9 +133,10 @@ def calibrate_camera(
     square_size: float,
     pattern_type: Literal["chessboard", "symmetric_circles", "asymmetric_circles"] = "chessboard",
 ) -> tuple[CalibrationResult, list[DetectionResult]]:
-    object_points = build_object_points(pattern_size, square_size)
+    object_points = build_object_points(pattern_size, square_size, pattern_type)
     obj_points_list: list[np.ndarray] = []
     img_points_list: list[np.ndarray] = []
+    valid_image_paths: list[Path] = []
     all_results: list[DetectionResult] = []
 
     for path in image_paths:
@@ -137,6 +151,7 @@ def calibrate_camera(
         if result.success and result.corners is not None:
             obj_points_list.append(object_points)
             img_points_list.append(result.corners)
+            valid_image_paths.append(path)
 
     if len(obj_points_list) < 2:
         raise ValueError(f"成功检测的图片不足（仅 {len(obj_points_list)} 张），至少需要 2 张才能标定。")
@@ -161,14 +176,10 @@ def calibrate_camera(
 
     # Compute per-image reprojection errors
     per_image_errors: list[tuple[str, float]] = []
-    total_error = 0.0
-    for i, (objp, imgp, rvec, tvec) in enumerate(zip(obj_points_list, img_points_list, rvecs, tvecs)):
+    for path, objp, imgp, rvec, tvec in zip(valid_image_paths, obj_points_list, img_points_list, rvecs, tvecs):
         projected, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
         error = float(np.sqrt(np.mean((imgp - projected) ** 2)))
-        per_image_errors.append((str(image_paths[i].name), error))
-        total_error += error
-
-    mean_error = total_error / len(obj_points_list) if obj_points_list else 0.0
+        per_image_errors.append((str(path.name), error))
 
     return CalibrationResult(
         fx=float(camera_matrix[0, 0]),
@@ -184,10 +195,15 @@ def calibrate_camera(
     ), all_results
 
 
-def draw_detected_corners(image: np.ndarray, corners: np.ndarray | None) -> np.ndarray:
+def draw_detected_corners(
+    image: np.ndarray,
+    corners: np.ndarray | None,
+    pattern_size: tuple[int, int] | None = None,
+) -> np.ndarray:
     img = image.copy()
     if corners is not None:
-        cv2.drawChessboardCorners(img, (0, 0), corners, True)
+        if pattern_size is not None:
+            cv2.drawChessboardCorners(img, (pattern_size[1], pattern_size[0]), corners, True)
         for i, corner in enumerate(corners):
             x, y = int(corner[0][0]), int(corner[0][1])
             cv2.circle(img, (x, y), 3, (0, 0, 255), -1)

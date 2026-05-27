@@ -368,7 +368,8 @@ class MainWindow(QMainWindow):
         markers: list[tuple[float, float, str, QColor]] = []
         result = self.detection_results.get(path.name)
         if result is not None and result.corners is not None:
-            display_img = draw_detected_corners(img, result.corners)
+            pattern_size, _, _ = self._get_pattern_params()
+            display_img = draw_detected_corners(img, result.corners, pattern_size)
             for i, corner in enumerate(result.corners):
                 u, v = float(corner[0][0]), float(corner[0][1])
                 if i < 5 or i == len(result.corners) - 1:
