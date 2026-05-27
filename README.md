@@ -1,7 +1,8 @@
-# LiDAR 标定工具箱 (LiDAR Calibration Suite)
+# 标定工具箱 (Calibration Toolbox)
 
 统一的启动入口，将多个标定工具整合在一起：
 
+- **Camera 内参标定** (`camera_intrinsic_calib`)
 - **LiDAR → Camera 联合标定** (`lidar_camera_calib`)
 - **LiDAR → LiDAR 外参标定** (`lidar_extrinsic_calib_qt`)
 - **LiDAR → IMU 外参标定** (`lidar_imu_calib_qt`)
@@ -11,7 +12,7 @@
 首次使用先创建本地 Python 环境并安装依赖：
 
 ```bash
-cd /path/to/lidar_calib_suite
+cd /path/to/calibration_toolbox
 python3 -m venv .venv
 .venv/bin/python -m pip install -U pip setuptools wheel
 .venv/bin/python -m pip install -r requirements.txt
@@ -24,7 +25,7 @@ sudo apt install python3 python3-venv
 ```
 
 ```bash
-cd /path/to/lidar_calib_suite
+cd /path/to/calibration_toolbox
 source .venv/bin/activate
 ./run_tool.sh
 ```
@@ -40,10 +41,14 @@ source .venv/bin/activate
 ## 项目结构
 
 ```
-lidar_calib_suite/
+calibration_toolbox/
 ├── launcher.py                 # 统一启动器（选择界面）
 ├── run_tool.sh                 # 启动脚本
 ├── README.md
+├── camera_intrinsic_calib/      # 相机内参标定
+│   ├── main_window.py
+│   ├── widgets.py
+│   └── calibrator.py
 ├── lidar_camera_calib/         # 激光雷达-相机联合标定
 │   ├── main_window.py
 │   ├── widgets.py
